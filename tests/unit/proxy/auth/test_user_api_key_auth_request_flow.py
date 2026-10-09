@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
@@ -16,8 +17,10 @@ from typing import Final
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 
+import orjson
 import pytest
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
+from starlette.datastructures import UploadFile
 
 import litellm
 import litellm.proxy.proxy_server
@@ -30,6 +33,8 @@ from litellm.proxy._types import (
     LiteLLM_EndUserTable,
     LiteLLM_ObjectPermissionTable,
     LiteLLM_OrganizationTable,
+    LiteLLM_ProjectTableCachedObj,
+    LiteLLM_TeamTable,
     LiteLLM_TeamTableCachedObj,
     LiteLLM_UserTable,
     Litellm_EntityType,
@@ -52,8 +57,10 @@ from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.common_utils.http_parsing_utils import get_client_requested_model
 from litellm.proxy.auth.user_api_key_auth import (
     _check_key_model_budget_with_fallback,
+    _check_team_member_model_budget_with_fallback,
     _ensure_litellm_received_at_on_request_state,
     _ensure_parent_otel_span_on_request_state,
+    _load_team_member_default_model_budget,
     _PendingAutoRegister,
     _matches_routing_override,
     _reserve_budget_after_common_checks,
@@ -4730,9 +4737,11 @@ async def test_centralized_common_checks_carries_team_and_user_budget_state_on_t
     )
     proxy_logging_obj = MagicMock()
     proxy_logging_obj.service_logging_obj.async_service_success_hook = AsyncMock()
+    database = MagicMock()
+    database.db.litellm_teammembership.find_unique = AsyncMock(return_value=None)
     attrs = {
         **_proxy_attrs_for_centralized_checks(user_custom_auth=None),
-        "prisma_client": MagicMock(),
+        "prisma_client": database,
         "user_api_key_cache": user_api_key_cache,
         "proxy_logging_obj": proxy_logging_obj,
     }
@@ -5009,6 +5018,338 @@ async def test_centralized_common_checks_enforces_team_model_max_budget_from_the
             setattr(_proxy_server_mod, k, v)
 
     assert limiter.calls == [("t1", team_caps, key_caps, "gpt-4o")]
+
+
+@pytest.mark.asyncio
+async def test_centralized_common_checks_loads_team_member_model_budget_even_when_checks_are_skipped():
+    from starlette.datastructures import URL
+
+    import litellm.proxy.proxy_server as _proxy_server_mod
+
+    member_caps: Final = {"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}}
+    member_budget_row: Final = LiteLLM_BudgetTable(budget_id="member-budget-1", model_max_budget=member_caps)
+    token: Final = UserAPIKeyAuth(api_key="sk-test", token="hashed", user_id="u1", team_id="t1")
+    request: Final = Request(scope={"type": "http"})
+    request._url = URL(url="/chat/completions")
+    user_api_key_cache: Final = DualCache()
+    await user_api_key_cache.async_set_cache(
+        key="team_id:t1",
+        value=LiteLLM_TeamTableCachedObj(
+            team_id="t1",
+            metadata={"team_member_budget_id": "member-budget-1"},
+        ),
+    )
+    await user_api_key_cache.async_set_cache(
+        key="team_member_default_budget:member-budget-1",
+        value=LiteLLM_BudgetTable(budget_id="member-budget-1", model_max_budget=member_caps),
+    )
+    attrs: Final = {
+        **_proxy_attrs_for_centralized_checks(user_custom_auth=None),
+        "prisma_client": MagicMock(),
+        "user_api_key_cache": user_api_key_cache,
+    }
+    originals: Final = {attribute: getattr(_proxy_server_mod, attribute, None) for attribute in attrs}
+    try:
+        for attribute, value in attrs.items():
+            setattr(_proxy_server_mod, attribute, value)
+        with (
+            patch("litellm.proxy.auth.user_api_key_auth._should_skip_budget_checks", return_value=True),
+            patch("litellm.proxy.auth.user_api_key_auth.common_checks", new_callable=AsyncMock),
+            patch("litellm.proxy.auth.user_api_key_auth._reserve_budget_after_common_checks", new_callable=AsyncMock),
+            patch("litellm.proxy.auth.user_api_key_auth.get_user_object", new_callable=AsyncMock, return_value=None),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget",
+                new_callable=AsyncMock,
+                return_value=member_budget_row,
+            ) as load_member_budget,
+        ):
+            await run_centralized_common_checks(
+                user_api_key_auth_obj=token,
+                request=request,
+                request_data={"model": "gpt-4o"},
+                route="/chat/completions",
+            )
+    finally:
+        for attribute, value in originals.items():
+            setattr(_proxy_server_mod, attribute, value)
+
+    assert token.team_member_model_max_budget == member_caps
+    load_member_budget.assert_awaited_once_with(
+        budget_id="member-budget-1",
+        prisma_client=attrs["prisma_client"],
+        user_api_key_cache=user_api_key_cache,
+        raise_on_lookup_error=True,
+    )
+
+
+def _team_member_model_budget_load_inputs() -> tuple[UserAPIKeyAuth, LiteLLM_TeamTableCachedObj, MagicMock, DualCache]:
+    token: Final = UserAPIKeyAuth(user_id="member-1", team_id="team-1")
+    team_object: Final = LiteLLM_TeamTableCachedObj(
+        team_id="team-1",
+        metadata={"team_member_budget_id": "default-budget"},
+    )
+    prisma_client: Final = MagicMock()
+    user_api_key_cache: Final = DualCache()
+    return token, team_object, prisma_client, user_api_key_cache
+
+
+@pytest.mark.asyncio
+async def test_member_model_budget_load_prefers_override_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    member_caps: Final = {"claude-sonnet-4-6": {"max_budget": 2.0, "budget_duration": "1d"}}
+    membership: Final = SimpleNamespace(
+        budget_id="member-budget",
+        litellm_budget_table=LiteLLM_BudgetTable(budget_id="member-budget", model_max_budget=member_caps),
+    )
+    membership_reader: Final = AsyncMock(return_value=membership)
+    default_reader: Final = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.auth.user_api_key_auth.get_team_membership", membership_reader)
+    monkeypatch.setattr("litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget", default_reader)
+
+    await _load_team_member_default_model_budget(
+        user_api_key_auth_obj=token,
+        team_object=team_object,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        skip_budget_checks=False,
+        proxy_logging_obj=None,
+    )
+
+    assert token.team_member_model_max_budget == member_caps
+    default_reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_member_model_budget_load_uses_override_without_team_default_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    team_object = LiteLLM_TeamTableCachedObj(team_id=team_object.team_id, metadata={})
+    member_caps: Final = {"claude-sonnet-4-6": {"max_budget": 2.0, "budget_duration": "1d"}}
+    membership: Final = SimpleNamespace(
+        budget_id="member-budget",
+        litellm_budget_table=LiteLLM_BudgetTable(budget_id="member-budget", model_max_budget=member_caps),
+    )
+    default_reader: Final = AsyncMock()
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+        AsyncMock(return_value=membership),
+    )
+    monkeypatch.setattr("litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget", default_reader)
+
+    await _load_team_member_default_model_budget(
+        user_api_key_auth_obj=token,
+        team_object=team_object,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        skip_budget_checks=False,
+        proxy_logging_obj=None,
+    )
+
+    assert token.team_member_model_max_budget == member_caps
+    default_reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_member_model_budget_load_reads_current_default_not_joined_default_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    stale_caps: Final = {"claude-sonnet-4-6": {"max_budget": 3.0, "budget_duration": "1d"}}
+    current_caps: Final = {"claude-sonnet-4-6": {"max_budget": 1.0, "budget_duration": "1d"}}
+    membership: Final = SimpleNamespace(
+        budget_id="default-budget",
+        litellm_budget_table=LiteLLM_BudgetTable(budget_id="default-budget", model_max_budget=stale_caps),
+    )
+    default_reader: Final = AsyncMock(
+        return_value=LiteLLM_BudgetTable(budget_id="default-budget", model_max_budget=current_caps)
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+        AsyncMock(return_value=membership),
+    )
+    monkeypatch.setattr("litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget", default_reader)
+
+    await _load_team_member_default_model_budget(
+        user_api_key_auth_obj=token,
+        team_object=team_object,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        skip_budget_checks=False,
+        proxy_logging_obj=None,
+    )
+
+    assert token.team_member_model_max_budget == current_caps
+    default_reader.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_member_model_budget_load_overall_only_override_keeps_default_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    default_caps: Final = {"claude-sonnet-4-6": {"max_budget": 3.0, "budget_duration": "1d"}}
+    membership: Final = SimpleNamespace(
+        budget_id="member-budget",
+        litellm_budget_table=LiteLLM_BudgetTable(budget_id="member-budget", max_budget=5.0, model_max_budget=None),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+        AsyncMock(return_value=membership),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget",
+        AsyncMock(return_value=LiteLLM_BudgetTable(budget_id="default-budget", model_max_budget=default_caps)),
+    )
+
+    await _load_team_member_default_model_budget(
+        user_api_key_auth_obj=token,
+        team_object=team_object,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        skip_budget_checks=False,
+        proxy_logging_obj=None,
+    )
+
+    assert token.team_member_model_max_budget == default_caps
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleared_member_caps", [None, {}], ids=["null", "empty"])
+async def test_member_model_budget_load_falls_back_when_override_has_no_model_caps(
+    monkeypatch: pytest.MonkeyPatch,
+    cleared_member_caps: dict[str, object] | None,
+) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    default_caps: Final = {"claude-sonnet-4-6": {"max_budget": 3.0, "budget_duration": "1d"}}
+    membership: Final = SimpleNamespace(
+        budget_id="member-budget",
+        litellm_budget_table=LiteLLM_BudgetTable(budget_id="member-budget", model_max_budget=cleared_member_caps),
+    )
+    default_budget: Final = LiteLLM_BudgetTable(budget_id="default-budget", model_max_budget=default_caps)
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+        AsyncMock(return_value=membership),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget",
+        AsyncMock(return_value=default_budget),
+    )
+
+    await _load_team_member_default_model_budget(
+        user_api_key_auth_obj=token,
+        team_object=team_object,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        skip_budget_checks=False,
+        proxy_logging_obj=None,
+    )
+
+    assert token.team_member_model_max_budget == default_caps
+
+
+@pytest.mark.asyncio
+async def test_member_model_budget_load_uses_default_without_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    default_caps: Final = {"claude-sonnet-4-6": {"max_budget": 3.0, "budget_duration": "1d"}}
+    default_budget: Final = LiteLLM_BudgetTable(budget_id="default-budget", model_max_budget=default_caps)
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget",
+        AsyncMock(return_value=default_budget),
+    )
+
+    await _load_team_member_default_model_budget(
+        user_api_key_auth_obj=token,
+        team_object=team_object,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        skip_budget_checks=False,
+        proxy_logging_obj=None,
+    )
+
+    assert token.team_member_model_max_budget == default_caps
+
+
+@pytest.mark.asyncio
+async def test_member_model_budget_load_fails_closed_on_default_lookup_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget",
+        AsyncMock(side_effect=RuntimeError("budget database unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="budget database unavailable"):
+        await _load_team_member_default_model_budget(
+            user_api_key_auth_obj=token,
+            team_object=team_object,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            skip_budget_checks=False,
+            proxy_logging_obj=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_member_model_budget_load_skips_default_lookup_error_when_checks_are_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget",
+        AsyncMock(side_effect=RuntimeError("budget database unavailable")),
+    )
+
+    await _load_team_member_default_model_budget(
+        user_api_key_auth_obj=token,
+        team_object=team_object,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        skip_budget_checks=True,
+        proxy_logging_obj=None,
+    )
+
+    assert token.team_member_model_max_budget is None
+
+
+@pytest.mark.asyncio
+async def test_member_model_budget_load_allows_missing_default_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.get_team_member_default_budget",
+        AsyncMock(return_value=None),
+    )
+
+    await _load_team_member_default_model_budget(
+        user_api_key_auth_obj=token,
+        team_object=team_object,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        skip_budget_checks=False,
+        proxy_logging_obj=None,
+    )
+
+    assert token.team_member_model_max_budget is None
 
 
 @pytest.mark.asyncio
@@ -5331,11 +5672,13 @@ async def test_team_key_vector_store_access_when_team_cannot_be_resolved(
     request._url = URL(url="/v1/rag/query")
     database: Final = MagicMock()
     database.db.litellm_objectpermissiontable.find_unique = AsyncMock(
-        side_effect=lambda where: LiteLLM_ObjectPermissionTable(
-            object_permission_id=where["object_permission_id"], vector_stores=["KBSTOREA"]
+        side_effect=lambda where: (
+            LiteLLM_ObjectPermissionTable(
+                object_permission_id=where["object_permission_id"], vector_stores=["KBSTOREA"]
+            )
+            if where["object_permission_id"] == "key-permission"
+            else None
         )
-        if where["object_permission_id"] == "key-permission"
-        else None
     )
     attrs: Final = {
         **_proxy_attrs_for_centralized_checks(),
@@ -5421,10 +5764,13 @@ async def test_keyless_team_member_vector_store_access_uses_only_the_resolved_te
     async def get_team(team_id: str, **_: object) -> LiteLLM_TeamTableCachedObj:
         if isinstance(team_lookup, Exception):
             raise team_lookup
-        return LiteLLM_TeamTableCachedObj(team_id=team_id, models=["gpt-4o-mini"], object_permission_id=team_lookup[team_id])
+        return LiteLLM_TeamTableCachedObj(
+            team_id=team_id, models=["gpt-4o-mini"], object_permission_id=team_lookup[team_id]
+        )
 
     monkeypatch.setattr("litellm.proxy.auth.user_api_key_auth.get_team_object", get_team)
     monkeypatch.setattr("litellm.proxy.auth.auth_checks.get_team_membership", AsyncMock(return_value=None))
+    monkeypatch.setattr("litellm.proxy.auth.user_api_key_auth.get_team_membership", AsyncMock(return_value=None))
     monkeypatch.setattr(
         "litellm.proxy.auth.user_api_key_auth.get_user_object",
         AsyncMock(
@@ -6683,6 +7029,7 @@ async def test_centralized_common_checks_inherits_org_identity(
 
     attrs = _proxy_attrs_for_centralized_checks(user_custom_auth=None)
     attrs["prisma_client"] = MagicMock()
+    attrs["prisma_client"].db.litellm_teammembership.find_unique = AsyncMock(return_value=None)
     attrs["general_settings"] = {"allow_requests_on_db_unavailable": allow_db_unavailable}
     originals = {a: getattr(_proxy_server_mod, a, None) for a in attrs}
     try:
@@ -8377,6 +8724,1466 @@ class TestCheckKeyModelBudgetWithFallback:
 
         assert exc_info.value is original_error
         assert "model" not in request_data
+
+
+class TestCheckTeamMemberModelBudgetWithFallback:
+    def _identity_model_group(self, model: str) -> str:
+        return model
+
+    def _router(self, fallbacks: list[dict[str, object]] | None) -> MagicMock:
+        router = MagicMock()
+        router.fallbacks = fallbacks
+        router.routable_model_group.side_effect = self._identity_model_group
+        return router
+
+    def _request(self, model: str) -> Request:
+        return Request(scope={"type": "http", "path_params": {"model": model}, "headers": []})
+
+    @pytest.mark.asyncio
+    async def test_within_budget_does_not_rewrite_request(self):
+        budget: Final = {"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}}
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget=budget,
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.return_value = True
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        await _check_team_member_model_budget_with_fallback(
+            valid_token=valid_token,
+            model_max_budget_limiter=limiter,
+            models=["gpt-4o"],
+            request_data=request_data,
+            request=request,
+            llm_model_list=None,
+            llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+        )
+
+        assert request_data["model"] == "gpt-4o"
+        assert request.scope["path_params"]["model"] == "gpt-4o"
+        assert "parsed_body" not in request.scope
+
+    @pytest.mark.asyncio
+    async def test_generic_fallback_rewrites_every_request_view(self):
+        budget: Final = {"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}}
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["gpt-4o", "gpt-4o-mini"],
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget=budget,
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o", "auth_injected_metadata": {"internal": "value"}}
+        request: Final = self._request("gpt-4o")
+        client_body: Final = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}
+        request.scope["parsed_body"] = (tuple(client_body), client_body)
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["gpt-4o"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=self._router([{"*": ["gpt-4o-mini"]}]),
+            )
+
+        assert request_data["model"] == "gpt-4o-mini"
+        expected_body: Final = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}]}
+        assert request._json == expected_body
+        assert orjson.loads(request._body) == expected_body
+        assert request.scope["parsed_body"][1] == expected_body
+        assert "auth_injected_metadata" not in request._json
+        assert request.scope["path_params"]["model"] == "gpt-4o-mini"
+
+    @pytest.mark.asyncio
+    async def test_specific_fallback_rewrites_requested_model(self):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["gpt-4o"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+            )
+
+        assert request_data["model"] == "gpt-4o-mini"
+        assert request.scope["path_params"]["model"] == "gpt-4o-mini"
+
+    @pytest.mark.asyncio
+    async def test_multipart_request_keeps_member_budget_error_without_rewriting(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, None]
+        uploaded_file: Final = UploadFile(filename="audio.wav", file=BytesIO(b"audio"))
+        request_data: Final = {"model": "claude-sonnet-4-6", "file": uploaded_file}
+        request: Final = Request(
+            scope={
+                "type": "http",
+                "path_params": {"model": "claude-sonnet-4-6"},
+                "headers": [(b"content-type", b"Multipart/Form-Data; boundary=test")],
+            }
+        )
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+            patch(
+                "litellm.proxy.proxy_server.proxy_config.get_hierarchical_router_settings",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"claude-sonnet-4-6": ["claude-haiku-4-5"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "claude-sonnet-4-6"
+        assert request_data["file"] is uploaded_file
+        assert request.scope["path_params"]["model"] == "claude-sonnet-4-6"
+        assert getattr(request, "_body", None) is None
+        limiter.is_team_member_within_model_budget.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_provider_scoped_resource_keeps_member_budget_error_without_fallback(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["claude-sonnet-4-6", "claude-haiku-4-5"],
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, None]
+        request_data: Final[dict[str, object]] = {
+            "model": "claude-sonnet-4-6",
+            "input_file_id": "file-123",
+        }
+        request: Final = self._request("claude-sonnet-4-6")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+            patch(
+                "litellm.proxy.proxy_server.proxy_config.get_hierarchical_router_settings",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"claude-sonnet-4-6": ["claude-haiku-4-5"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data == {
+            "model": "claude-sonnet-4-6",
+            "input_file_id": "file-123",
+        }
+        assert request.scope["path_params"]["model"] == "claude-sonnet-4-6"
+        limiter.is_team_member_within_model_budget.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fallback_prefers_hierarchical_router_settings_fallbacks(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        router_settings: Final = {"fallbacks": [{"claude-sonnet-4-6": ["claude-haiku-4-5"]}]}
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={
+                "claude-sonnet-4-6": {"max_budget": 5.0},
+                "claude-haiku-4-5": {"max_budget": 5.0},
+            },
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, None]
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+        router: Final = self._router([{"claude-sonnet-4-6": ["global-backup"]}])
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+            patch(
+                "litellm.proxy.proxy_server.proxy_config.get_hierarchical_router_settings",
+                new_callable=AsyncMock,
+                return_value=router_settings,
+            ),
+        ):
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["claude-sonnet-4-6"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=router,
+            )
+
+        assert request_data["model"] == "claude-haiku-4-5"
+        assert request.scope["path_params"]["model"] == "claude-haiku-4-5"
+        assert [call.kwargs["model"] for call in limiter.is_team_member_within_model_budget.call_args_list] == [
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fallback_resolves_router_alias_before_budget_check(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            router_settings={"model_group_alias": {"backup": "expensive"}},
+            team_member_model_max_budget={
+                "claude-sonnet-4-6": {"max_budget": 5.0},
+                "expensive": {"max_budget": 5.0},
+            },
+        )
+        limiter: Final = AsyncMock()
+
+        async def member_budget_check(*, model: str, **_kwargs: object) -> None:
+            if model != "backup":
+                raise original_error
+
+        limiter.is_team_member_within_model_budget.side_effect = member_budget_check
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"claude-sonnet-4-6": ["backup"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "claude-sonnet-4-6"
+        assert [call.kwargs["model"] for call in limiter.is_team_member_within_model_budget.call_args_list] == [
+            "claude-sonnet-4-6",
+            "backup",
+            "expensive",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fallback_checks_global_router_alias_budget_before_rerouting(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={
+                "claude-sonnet-4-6": {"max_budget": 5.0},
+                "expensive": {"max_budget": 5.0},
+            },
+        )
+        limiter: Final = AsyncMock()
+
+        async def member_budget_check(*, model: str, **_kwargs: object) -> None:
+            if model in {"claude-sonnet-4-6", "expensive"}:
+                raise original_error
+
+        limiter.is_team_member_within_model_budget.side_effect = member_budget_check
+        request_data: Final[dict[str, object]] = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+        router: Final = self._router([{"claude-sonnet-4-6": ["backup"]}])
+
+        def resolve_global_alias(model: str) -> str:
+            return "expensive" if model == "backup" else model
+
+        router.routable_model_group.side_effect = resolve_global_alias
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+            patch(
+                "litellm.proxy.proxy_server.proxy_config.get_hierarchical_router_settings",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=router,
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "claude-sonnet-4-6"
+        assert [call.kwargs["model"] for call in limiter.is_team_member_within_model_budget.call_args_list] == [
+            "claude-sonnet-4-6",
+            "backup",
+            "expensive",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fallback_checks_key_team_alias_budget_before_rerouting(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        model_group_alias: Final = {"backup": "expensive"}
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            router_settings={"model_group_alias": model_group_alias},
+            team_member_model_max_budget={
+                "claude-sonnet-4-6": {"max_budget": 5.0},
+                "backup": {"max_budget": 5.0},
+            },
+        )
+        limiter: Final = AsyncMock()
+
+        async def member_budget_check(*, model: str, **_kwargs: object) -> None:
+            if model in {"claude-sonnet-4-6", "backup"}:
+                raise original_error
+
+        limiter.is_team_member_within_model_budget.side_effect = member_budget_check
+        request_data: Final[dict[str, object]] = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+        router: Final = self._router([{"claude-sonnet-4-6": ["backup"]}])
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+            patch(
+                "litellm.proxy.proxy_server.proxy_config.get_hierarchical_router_settings",
+                new_callable=AsyncMock,
+                return_value={"model_group_alias": model_group_alias},
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=router,
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "claude-sonnet-4-6"
+        assert [call.kwargs["model"] for call in limiter.is_team_member_within_model_budget.call_args_list] == [
+            "claude-sonnet-4-6",
+            "backup",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fallback_rewrites_router_alias_to_budget_checked_target(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            router_settings={"model_group_alias": {"backup": "expensive"}},
+            team_member_model_max_budget={
+                "claude-sonnet-4-6": {"max_budget": 5.0},
+                "expensive": {"max_budget": 5.0},
+            },
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, None, None]
+        request_data: Final[dict[str, object]] = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+        ):
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["claude-sonnet-4-6"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=self._router([{"claude-sonnet-4-6": ["backup"]}]),
+            )
+
+        assert request_data["model"] == "expensive"
+        assert request.scope["path_params"]["model"] == "expensive"
+        assert [call.kwargs["model"] for call in limiter.is_team_member_within_model_budget.call_args_list] == [
+            "claude-sonnet-4-6",
+            "backup",
+            "expensive",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fallback_settings_lookup_error_keeps_original_budget_error(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = original_error
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.proxy_server.proxy_config.get_hierarchical_router_settings",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("settings unavailable"),
+            ) as get_settings,
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"claude-sonnet-4-6": ["backup"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "claude-sonnet-4-6"
+        limiter.is_team_member_within_model_budget.assert_awaited_once()
+        get_settings.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fallback_skips_candidate_after_budget_check_error(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            router_settings={"model_group_alias": {}},
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [
+            original_error,
+            RuntimeError("budget counter unavailable"),
+            None,
+        ]
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+        ):
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["claude-sonnet-4-6"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=self._router([{"claude-sonnet-4-6": ["backup-unavailable", "backup-valid"]}]),
+            )
+
+        assert request_data["model"] == "backup-valid"
+        assert request.scope["path_params"]["model"] == "backup-valid"
+        assert [call.kwargs["model"] for call in limiter.is_team_member_within_model_budget.call_args_list] == [
+            "claude-sonnet-4-6",
+            "backup-unavailable",
+            "backup-valid",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fallback_candidate_check_errors_keep_original_budget_error(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            router_settings={"model_group_alias": {}},
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [
+            original_error,
+            RuntimeError("budget counter unavailable"),
+        ]
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+
+        with patch(
+            "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"claude-sonnet-4-6": ["backup-unavailable"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_fallback_outside_project_models_raises_original_member_budget_error(
+        self,
+    ) -> None:
+        original_error: Final = litellm.BudgetExceededError(
+            message="member model budget exceeded",
+            current_cost=10,
+            max_budget=5,
+        )
+        valid_token: Final = UserAPIKeyAuth(
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+        project_object: Final = LiteLLM_ProjectTableCachedObj(
+            project_id="project-1",
+            models=["claude-sonnet-4-6"],
+        )
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"claude-sonnet-4-6": ["claude-haiku-4-5"]}]),
+                    project_object=project_object,
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_fallback_within_project_models_rewrites_request(
+        self,
+    ) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+        project_object: Final = LiteLLM_ProjectTableCachedObj(
+            project_id="project-1",
+            models=["claude-sonnet-4-6", "claude-haiku-4-5"],
+        )
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["claude-sonnet-4-6"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=self._router([{"claude-sonnet-4-6": ["claude-haiku-4-5"]}]),
+                project_object=project_object,
+            )
+
+        assert request_data["model"] == "claude-haiku-4-5"
+        assert request.scope["path_params"]["model"] == "claude-haiku-4-5"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("grant_source", ["team", "key"])
+    async def test_fallback_uses_team_and_key_access_group_grants(self, grant_source: str) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            team_models=["claude-sonnet-4-6"],
+            access_group_ids=["key-group"] if grant_source == "key" else [],
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        team_object: Final = LiteLLM_TeamTable(
+            team_id="team-1",
+            models=["claude-sonnet-4-6"],
+            access_group_ids=["team-group"] if grant_source == "team" else [],
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, None]
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+        prisma_client: Final = MagicMock()
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.auth_checks.get_models_from_access_groups",
+                new_callable=AsyncMock,
+                return_value=["claude-haiku-4-5"],
+            ) as team_group_models,
+            patch(
+                "litellm.proxy.auth.auth_checks.get_authorized_resources_from_key_access_groups",
+                new_callable=AsyncMock,
+                return_value=["claude-haiku-4-5"],
+            ) as key_group_models,
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+        ):
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["claude-sonnet-4-6"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=self._router([{"claude-sonnet-4-6": ["claude-haiku-4-5"]}]),
+                team_object=team_object,
+                prisma_client=prisma_client,
+                user_api_key_cache=MagicMock(),
+                proxy_logging_obj=MagicMock(),
+            )
+
+        assert request_data["model"] == "claude-haiku-4-5"
+        if grant_source == "team":
+            team_group_models.assert_awaited_once_with(
+                access_group_ids=["team-group"],
+                prisma_client=prisma_client,
+            )
+            key_group_models.assert_not_awaited()
+        else:
+            team_group_models.assert_not_awaited()
+            key_group_models.assert_awaited_once_with(
+                valid_token=valid_token,
+                team_object=team_object,
+                resource_field="access_model_names",
+            )
+
+    @pytest.mark.asyncio
+    async def test_fallback_without_team_or_key_access_group_grants_keeps_budget_error(self) -> None:
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            user_id="user-1",
+            team_id="team-1",
+            team_models=["claude-sonnet-4-6"],
+            team_member_model_max_budget={"claude-sonnet-4-6": {"max_budget": 5.0}},
+        )
+        team_object: Final = LiteLLM_TeamTable(team_id="team-1", models=["claude-sonnet-4-6"])
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, None]
+        request_data: Final = {"model": "claude-sonnet-4-6"}
+        request: Final = self._request("claude-sonnet-4-6")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["claude-sonnet-4-6"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"claude-sonnet-4-6": ["claude-haiku-4-5"]}]),
+                    team_object=team_object,
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_exhausted_fallback_raises_original_member_budget_error(self):
+        budget: Final = {"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}}
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget=budget,
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, original_error]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        with patch(
+            "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_no_router_fallback_raises_original_member_budget_error(self):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        with pytest.raises(litellm.BudgetExceededError) as exc_info:
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["gpt-4o"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=None,
+            )
+
+        assert exc_info.value is original_error
+
+    @pytest.mark.asyncio
+    async def test_router_without_fallbacks_raises_original_member_budget_error(self):
+        original_error: Final = litellm.BudgetExceededError(
+            message="member model budget exceeded", current_cost=10, max_budget=5
+        )
+        budget: Final = {"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}}
+        valid_token: Final = UserAPIKeyAuth(
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget=budget,
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        with pytest.raises(litellm.BudgetExceededError) as exc_info:
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["gpt-4o"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=self._router(None),
+            )
+
+        assert exc_info.value.message == "member model budget exceeded"
+        assert request_data["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_fallback_exceeding_key_budget_is_rejected(self):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            model_max_budget={"gpt-4o-mini": {"max_budget": 1.0, "budget_duration": "1d"}},
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        limiter.is_key_within_model_budget.side_effect = litellm.BudgetExceededError(current_cost=2, max_budget=1)
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        with patch(
+            "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+                )
+
+        assert exc_info.value is original_error
+        limiter.is_key_within_model_budget.assert_awaited_once_with(
+            user_api_key_dict=valid_token,
+            model="gpt-4o-mini",
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_outside_key_models_is_rejected(self):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["gpt-4o"],
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = original_error
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+        denied: Final = ProxyException(
+            message="model not allowed",
+            type=ProxyErrorTypes.budget_exceeded,
+            param="model",
+            code=status.HTTP_403_FORBIDDEN,
+        )
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                side_effect=denied,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_agent_key_does_not_reroute_to_fallback(self):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["gpt-4o", "gpt-4o-mini"],
+            user_id="user-1",
+            team_id="team-1",
+            agent_id="agent-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, None]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "gpt-4o"
+        assert getattr(request, "_json", None) is None
+
+    @pytest.mark.asyncio
+    async def test_agent_key_can_reroute_on_key_model_budget_fallback(self):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["gpt-4o", "gpt-4o-mini"],
+            agent_id="agent-1",
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_key_within_model_budget.side_effect = original_error
+        limiter.get_fallback_model_within_budget.return_value = "gpt-4o-mini"
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        with patch(
+            "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            await _check_key_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                model_name="gpt-4o",
+                request_data=request_data,
+                request=request,
+            )
+
+        assert request_data["model"] == "gpt-4o-mini"
+
+    @pytest.mark.asyncio
+    async def test_fallback_outside_member_allowed_models_is_rejected(self):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["gpt-4o", "gpt-4o-mini"],
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, None]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+        membership: Final = SimpleNamespace(litellm_budget_table=SimpleNamespace(allowed_models=["gpt-4o"]))
+        denied: Final = ProxyException(
+            message="member model not allowed",
+            type=ProxyErrorTypes.budget_exceeded,
+            param="model",
+            code=status.HTTP_403_FORBIDDEN,
+        )
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=membership,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth._can_object_call_model",
+                side_effect=denied,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+                )
+
+        assert exc_info.value is original_error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("targets", "expected_model"),
+        [
+            ([{"model": "gpt-4o-mini"}], "gpt-4o-mini"),
+            ([{"model": "gpt-4o-mini", "temperature": 0.2}, {"model": "claude-haiku"}], "claude-haiku"),
+            ([{"model": "gpt-4o-mini", "temperature": 0.2}], None),
+        ],
+    )
+    async def test_dict_fallback_targets_only_reroute_model_only_entries(self, targets, expected_model):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["gpt-4o", "gpt-4o-mini", "claude-haiku"],
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0, "budget_duration": "1d"}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            if expected_model is not None:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"gpt-4o": targets}]),
+                )
+                assert request_data["model"] == expected_model
+            else:
+                with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                    await _check_team_member_model_budget_with_fallback(
+                        valid_token=valid_token,
+                        model_max_budget_limiter=limiter,
+                        models=["gpt-4o"],
+                        request_data=request_data,
+                        request=request,
+                        llm_model_list=None,
+                        llm_router=self._router([{"gpt-4o": targets}]),
+                    )
+                assert exc_info.value is original_error
+                assert request_data["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_fallback_skips_candidate_denied_to_end_user(self):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+        denied: Final = ProxyException(
+            message="customer model access denied",
+            type=ProxyErrorTypes.budget_exceeded,
+            param="model",
+            code=status.HTTP_403_FORBIDDEN,
+        )
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_customer_access_model",
+                side_effect=denied,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+                    end_user_object=SimpleNamespace(models=["gpt-4o-mini"]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_fallback_skips_candidates_without_pricing(self, monkeypatch: pytest.MonkeyPatch):
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+        router: Final = self._router([{"gpt-4o": ["gpt-4o-mini"]}])
+        monkeypatch.setattr(litellm, "block_requests_for_models_without_pricing", True)
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth._unpriced_models_in_request",
+                return_value=("gpt-4o-mini",),
+            ) as unpriced,
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=router,
+                    route="/v1/chat/completions",
+                )
+
+        assert exc_info.value is original_error
+        unpriced.assert_called_once_with(model="gpt-4o-mini", llm_router=router)
+
+    @pytest.mark.asyncio
+    async def test_fallback_checks_candidate_access_group_budget_and_stamps_candidate_groups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import litellm.proxy.proxy_server as proxy_server
+
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["gpt-4o", "gpt-4o-mini"],
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+        monkeypatch.setattr(proxy_server, "prisma_client", MagicMock())
+        monkeypatch.setattr(proxy_server, "user_api_key_cache", MagicMock())
+        monkeypatch.setattr(proxy_server, "proxy_logging_obj", MagicMock())
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=("fallback-group",),
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth._model_access_group_max_budget_check",
+                new_callable=AsyncMock,
+            ) as group_budget_check,
+        ):
+            await _check_team_member_model_budget_with_fallback(
+                valid_token=valid_token,
+                model_max_budget_limiter=limiter,
+                models=["gpt-4o"],
+                request_data=request_data,
+                request=request,
+                llm_model_list=None,
+                llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+            )
+
+        assert request_data["model"] == "gpt-4o-mini"
+        assert valid_token.matched_model_access_groups == ["fallback-group"]
+        group_budget_check.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_access_group_budget_exhaustion_skips_fallback_candidate(self, monkeypatch: pytest.MonkeyPatch):
+        import litellm.proxy.proxy_server as proxy_server
+
+        original_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+        valid_token: Final = UserAPIKeyAuth(
+            token="test-key",
+            models=["gpt-4o", "gpt-4o-mini"],
+            user_id="user-1",
+            team_id="team-1",
+            team_member_model_max_budget={"gpt-4o": {"max_budget": 5.0}},
+        )
+        limiter: Final = AsyncMock()
+        limiter.is_team_member_within_model_budget.side_effect = [original_error, True]
+        request_data: Final = {"model": "gpt-4o"}
+        request: Final = self._request("gpt-4o")
+        monkeypatch.setattr(proxy_server, "prisma_client", MagicMock())
+        monkeypatch.setattr(proxy_server, "user_api_key_cache", MagicMock())
+        monkeypatch.setattr(proxy_server, "proxy_logging_obj", MagicMock())
+        group_error: Final = litellm.BudgetExceededError(current_cost=10, max_budget=5)
+
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_membership",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.can_key_call_model",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.stamp_matched_model_access_groups",
+                new_callable=AsyncMock,
+                return_value=("fallback-group",),
+            ),
+            patch(
+                "litellm.proxy.auth.user_api_key_auth._model_access_group_max_budget_check",
+                new_callable=AsyncMock,
+                side_effect=group_error,
+            ),
+        ):
+            with pytest.raises(litellm.BudgetExceededError) as exc_info:
+                await _check_team_member_model_budget_with_fallback(
+                    valid_token=valid_token,
+                    model_max_budget_limiter=limiter,
+                    models=["gpt-4o"],
+                    request_data=request_data,
+                    request=request,
+                    llm_model_list=None,
+                    llm_router=self._router([{"gpt-4o": ["gpt-4o-mini"]}]),
+                )
+
+        assert exc_info.value is original_error
+        assert request_data["model"] == "gpt-4o"
 
 
 @pytest.mark.asyncio
@@ -10185,9 +11992,7 @@ async def test_managed_agent_cannot_bypass_grants_with_server_default(
         monkeypatch.setattr(proxy_server, name, value)
     data = {"messages": [{"role": "user", "content": "hi"}], **({"model": requested} if requested else {})}
     auth = UserAPIKeyAuth(agent_id="managed")
-    auth.managed_agent_context = ManagedAgentContext(
-        agent_id="managed", binding_revision="revision", mode="autonomous"
-    )
+    auth.managed_agent_context = ManagedAgentContext(agent_id="managed", binding_revision="revision", mode="autonomous")
     if not grant_default:
         with pytest.raises(ProxyException) as denied:
             await _authorize_authenticated_request(auth, _alias_request(route, data), data, route, "persisted-key")
@@ -10217,12 +12022,21 @@ async def test_managed_jwt_cannot_be_downgraded_into_virtual_key_mapping(monkeyp
     from litellm.types.proxy.agent_identity import AgentIdentityBinding
 
     binding: Final = AgentIdentityBinding(
-        agent_id="managed", provider="microsoft_entra", issuer="issuer", tenant_id="tenant",
-        client_id="client", service_principal_id="principal", revision="current",
+        agent_id="managed",
+        provider="microsoft_entra",
+        issuer="issuer",
+        tenant_id="tenant",
+        client_id="client",
+        service_principal_id="principal",
+        revision="current",
     )
     agent: Final = AgentResponse(
-        agent_id="managed", agent_name="Managed", agent_card_params={},
-        identity_managed=True, identity=binding, execution_mode="autonomous",
+        agent_id="managed",
+        agent_name="Managed",
+        agent_card_params={},
+        identity_managed=True,
+        identity=binding,
+        execution_mode="autonomous",
     )
     client: Final = MagicMock()
     client.writer_db.litellm_agentidentity.find_unique = AsyncMock(return_value=binding)
@@ -10230,22 +12044,35 @@ async def test_managed_jwt_cannot_be_downgraded_into_virtual_key_mapping(monkeyp
     handler: Final = MagicMock()
     handler.is_jwt.return_value = True
     handler.litellm_jwtauth = LiteLLM_JWTAuth(virtual_key_claim_field="sub")
-    handler.auth_jwt = AsyncMock(return_value={
-        "iss": "issuer", "tid": "tenant", "azp": "client", "oid": "principal", "sub": "mapped-key",
-    })
+    handler.auth_jwt = AsyncMock(
+        return_value={
+            "iss": "issuer",
+            "tid": "tenant",
+            "azp": "client",
+            "oid": "principal",
+            "sub": "mapped-key",
+        }
+    )
     for name, value in {
         **_proxy_attrs_for_centralized_checks(),
-        "general_settings": {"enable_jwt_auth": True}, "premium_user": True,
-        "prisma_client": client, "jwt_handler": handler, "user_api_key_cache": UserApiKeyCache(),
+        "general_settings": {"enable_jwt_auth": True},
+        "premium_user": True,
+        "prisma_client": client,
+        "jwt_handler": handler,
+        "user_api_key_cache": UserApiKeyCache(),
         "proxy_logging_obj": MagicMock(post_call_failure_hook=AsyncMock(return_value=None)),
     }.items():
         monkeypatch.setattr(proxy_server, name, value)
     for _ in range(2):
         with pytest.raises(ProxyException) as failure:
             await user_api_key_auth_builder(
-                request=_alias_request("/v1/chat/completions", {}), api_key="Bearer verified.jwt.token",
-                azure_api_key_header="", anthropic_api_key_header=None, google_ai_studio_api_key_header=None,
-                azure_apim_header=None, request_data={},
+                request=_alias_request("/v1/chat/completions", {}),
+                api_key="Bearer verified.jwt.token",
+                azure_api_key_header="",
+                anthropic_api_key_header=None,
+                google_ai_studio_api_key_header=None,
+                azure_apim_header=None,
+                request_data={},
             )
         assert failure.value.code == "403"
         assert "without virtual-key mapping" in failure.value.message
@@ -10262,9 +12089,17 @@ async def test_virtual_key_cannot_enter_checks_as_an_identity_managed_actor(monk
     from litellm.types.proxy.agent_identity import AgentIdentityBinding
 
     target: Final = AgentResponse(
-        agent_id="bound", agent_name="Bound", agent_card_params={}, identity_managed=True,
+        agent_id="bound",
+        agent_name="Bound",
+        agent_card_params={},
+        identity_managed=True,
         identity=AgentIdentityBinding(
-            agent_id="bound", provider="microsoft_entra", tenant_id="tenant", client_id="client", issuer="issuer", revision="current"
+            agent_id="bound",
+            provider="microsoft_entra",
+            tenant_id="tenant",
+            client_id="client",
+            issuer="issuer",
+            revision="current",
         ),
     )
     client: Final = MagicMock()
@@ -10272,7 +12107,9 @@ async def test_virtual_key_cannot_enter_checks_as_an_identity_managed_actor(monk
     monkeypatch.setattr(proxy_server, "prisma_client", client)
     checks: Final = AsyncMock()
     monkeypatch.setattr(auth_module, "run_centralized_common_checks", checks)
-    monkeypatch.setattr(proxy_server, "proxy_logging_obj", MagicMock(post_call_failure_hook=AsyncMock(return_value=None)))
+    monkeypatch.setattr(
+        proxy_server, "proxy_logging_obj", MagicMock(post_call_failure_hook=AsyncMock(return_value=None))
+    )
     data: Final = {"model": "allowed", "messages": [{"role": "user", "content": "hello"}]}
     request: Final = _alias_request("/v1/chat/completions", data)
     with pytest.raises(ProxyException):
@@ -10300,16 +12137,24 @@ async def test_custom_auth_grants_reach_managed_targets_without_a_virtual_key_ro
     from litellm.types.proxy.agent_identity import AgentIdentityBinding
 
     target: Final = AgentResponse(
-        agent_id="target", agent_name="Target", agent_card_params={}, identity_managed=True,
+        agent_id="target",
+        agent_name="Target",
+        agent_card_params={},
+        identity_managed=True,
         identity=AgentIdentityBinding(
-            agent_id="target", provider="microsoft_entra", tenant_id="tenant", client_id="client",
-            issuer="issuer", revision="current",
+            agent_id="target",
+            provider="microsoft_entra",
+            tenant_id="tenant",
+            client_id="client",
+            issuer="issuer",
+            revision="current",
         ),
     )
     registry: Final = AgentRegistry()
     registry.register_agent(target)
     trusted: Final = UserAPIKeyAuth(
-        api_key=credential, object_permission={"object_permission_id": "custom", "agents": ["target"] if granted else ["other"]}
+        api_key=credential,
+        object_permission={"object_permission_id": "custom", "agents": ["target"] if granted else ["other"]},
     )
     custom: Final = AsyncMock(return_value=trusted)
     database: Final = MagicMock()
@@ -10325,9 +12170,13 @@ async def test_custom_auth_grants_reach_managed_targets_without_a_virtual_key_ro
     monkeypatch.setattr(agent_registry, "global_agent_registry", registry)
     monkeypatch.setattr(litellm, "enable_post_custom_auth_checks", False, raising=False)
     admitted: Final = await user_api_key_auth_builder(
-        request=_alias_request("/a2a/target/message/send", {}), api_key=f"Bearer {credential}",
-        azure_api_key_header="", anthropic_api_key_header=None, google_ai_studio_api_key_header=None,
-        azure_apim_header=None, request_data={},
+        request=_alias_request("/a2a/target/message/send", {}),
+        api_key=f"Bearer {credential}",
+        azure_api_key_header="",
+        anthropic_api_key_header=None,
+        google_ai_studio_api_key_header=None,
+        azure_apim_header=None,
+        request_data={},
     )
     assert await AgentRequestHandler.is_agent_allowed("target", admitted) is granted
     custom.assert_awaited_once()
@@ -10347,9 +12196,13 @@ async def test_enterprise_custom_auth_key_return_stays_a_proxy_validated_key(mon
     module: Final = importlib.import_module("litellm.proxy.auth.user_api_key_auth")
     monkeypatch.setattr(module, "enterprise_custom_auth", custom)
     admitted: Final = await user_api_key_auth_builder(
-        request=_alias_request("/v1/chat/completions", {}), api_key="Bearer external-credential",
-        azure_api_key_header="", anthropic_api_key_header=None, google_ai_studio_api_key_header=None,
-        azure_apim_header=None, request_data={},
+        request=_alias_request("/v1/chat/completions", {}),
+        api_key="Bearer external-credential",
+        azure_api_key_header="",
+        anthropic_api_key_header=None,
+        google_ai_studio_api_key_header=None,
+        azure_apim_header=None,
+        request_data={},
     )
     assert admitted.authenticated_by_custom_auth is False
     assert admitted.via_virtual_key is True
